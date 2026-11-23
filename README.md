@@ -36,7 +36,7 @@ Clone this repo, then build the dependent against your checkout without editing 
 cargo build --config "patch.'https://github.com/roest1/tui-core'.tui-core.path='$HOME/github/tui-core'"
 ```
 
-Never commit a `[patch]` section or a path dependency.
+That build rewrites the dependent's `Cargo.lock` to the unpinned path, so restore it (`git checkout Cargo.lock`) before committing. A `--locked` build fails on a lock left that way. Never commit a `[patch]` section or a path dependency.
 
 ## License
 

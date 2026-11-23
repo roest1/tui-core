@@ -1,12 +1,13 @@
 [package]
-name = "reticle"
+name = "tui-core"
 description = "Terminal UI core: an animated reticle, nvim navigation, and a redraw loop."
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/roest1/tui-core"
 
 [dependencies]
-crossterm.workspace = true
+crossterm = "0.29"
 libc = "0.2"
 base64 = "0.23"

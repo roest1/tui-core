@@ -13,6 +13,11 @@ were; trim them here.
   other half), `width` (how many CELLS a string occupies), `app` (the loop),
   `image` (inline images), `filter` (what `/` narrows a list to), `probe` (asks the
   terminal for its cell size and colors).
+- `tests/pty.rs` — the event loop, driven through a real pty. The unit tests are of
+  helpers; every bug the loop has had was in `app::event_loop`, which only this reaches.
+  A change to the loop gets a check here. It waits for the screen to show something
+  rather than sleeping, and a check that a key did NOT act uses a second key whose
+  effect depends on the first. `cargo test --test pty -- <name>` runs one.
 
 ## Things not to undo
 

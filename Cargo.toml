@@ -10,3 +10,9 @@ repository = "https://github.com/roest1/tui-core"
 crossterm = "0.29"
 libc = "0.2"
 base64 = "0.23"
+
+# The event loop, driven through a real pty. It runs ITSELF as the child, so it
+# has its own `main` rather than the standard harness. See the header of the file.
+[[test]]
+name = "pty"
+harness = false

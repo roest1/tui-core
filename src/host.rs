@@ -11,7 +11,8 @@
 //! Six things about one repo are not six levels deep. Modelling them as a stack
 //! means popping to a hub to get from Issues to PRs, which is two keystrokes to
 //! express "sideways" -- and the hub exists only to be passed through. Tabs are
-//! the honest shape for siblings, and `Tab`/shift-`Tab` is one keystroke.
+//! the honest shape for siblings: `k` off the top row reaches the strip and
+//! `h`/`l` move along it.
 //!
 //! The stack is still there and still means what it did: `Flow::Push` from
 //! inside a tab opens a screen over the WHOLE host, and `q` comes back to the
@@ -34,15 +35,18 @@ pub struct Host {
     names: Vec<String>,
     screens: Vec<Box<dyn Screen>>,
     active: usize,
-    /// Where the cursor was in each tab, by tab index.
-    marks: Vec<usize>,
+    /// Where the cursor was in each tab, by tab index. `None` until the tab
+    /// has been looked at -- which is not the same as "row 0": a tab left on
+    /// its first row must come back to its first row, not to wherever it
+    /// would have opened.
+    marks: Vec<Option<usize>>,
 }
 
 impl Host {
     /// `tabs` is (name, screen) in display order; at least one is required.
     pub fn new(label: Option<String>, tabs: Vec<(String, Box<dyn Screen>)>) -> Self {
         let (names, screens): (Vec<String>, Vec<Box<dyn Screen>>) = tabs.into_iter().unzip();
-        let marks = vec![0; screens.len()];
+        let marks = vec![None; screens.len()];
         Self {
             label,
             names,
@@ -72,6 +76,11 @@ impl Host {
         self.screens[self.active].as_mut()
     }
 
+    /// `current`, for the methods that only read.
+    fn active(&self) -> &dyn Screen {
+        self.screens[self.active].as_ref()
+    }
+
     fn step(&mut self, by: isize) -> Flow {
         if self.screens.len() < 2 {
             return Flow::Continue;
@@ -79,7 +88,7 @@ impl Host {
         let n = self.screens.len() as isize;
         // Wraps. A strip is a ring in every other tabbed thing on the machine,
         // and stopping at the ends makes the last tab awkward to reach.
-        self.active = (((self.active as isize + by) % n + n) % n) as usize;
+        self.active = (self.active as isize + by).rem_euclid(n) as usize;
         Flow::Retarget
     }
 }
@@ -110,7 +119,7 @@ impl Screen for Host {
     /// the table's badges, packed into a 52-column sidebar, truncated every
     /// branch name to nothing.
     fn split(&self) -> Split {
-        self.screens[self.active].split()
+        self.active().split()
     }
 
     /// Forwarded for the same reason `split` is, and forgotten for the same
@@ -141,7 +150,7 @@ impl Screen for Host {
     }
 
     fn footer(&self) -> String {
-        let child = self.screens[self.active].footer();
+        let child = self.active().footer();
         if self.screens.len() < 2 {
             return child;
         }
@@ -167,7 +176,7 @@ impl Screen for Host {
     }
 
     fn focus(&mut self, sel: usize) {
-        self.marks[self.active] = sel;
+        self.marks[self.active] = Some(sel);
         self.current().focus(sel);
     }
 
@@ -175,23 +184,14 @@ impl Screen for Host {
         // The remembered position if there is one, else let the tab answer for
         // itself -- which is how a freshly built tab still opens on the row it
         // wants (github's repo list on the repo you are standing in).
-        let mark = self.marks[self.active];
-        if mark > 0 {
-            mark
-        } else {
-            self.screens[self.active].initial_sel()
-        }
+        self.marks[self.active].unwrap_or_else(|| self.active().initial_sel())
     }
 
     fn on_action(&mut self, action: Action, sel: usize) -> Flow {
         match action {
-            Action::NextTab => {
-                self.marks[self.active] = sel;
-                self.step(1)
-            }
-            Action::PrevTab => {
-                self.marks[self.active] = sel;
-                self.step(-1)
+            Action::NextTab | Action::PrevTab => {
+                self.marks[self.active] = Some(sel);
+                self.step(if action == Action::NextTab { 1 } else { -1 })
             }
             other => self.current().on_action(other, sel),
         }
@@ -270,6 +270,47 @@ mod tests {
         assert_eq!(h.initial_sel(), 3);
     }
 
+    /// Row 0 is a place like any other. A tab that opens itself somewhere
+    /// else -- github's repo list, on the repo you are standing in -- and is
+    /// then left on its FIRST row must come back to the first row. Zero used
+    /// to double as "never visited", so it came back to where it opened.
+    #[test]
+    fn a_tab_left_on_its_first_row_comes_back_to_it() {
+        struct OpensLow;
+        impl Screen for OpensLow {
+            fn title(&self) -> String {
+                "low".into()
+            }
+            fn rows(&mut self) -> Vec<Row> {
+                (0..9).map(|i| Row::leaf(format!("l{i}"))).collect()
+            }
+            fn footer(&self) -> String {
+                String::new()
+            }
+            fn pane(&mut self, _: usize, _: u16, _: u16) -> Pane {
+                Pane::default()
+            }
+            fn on_action(&mut self, _: Action, _: usize) -> Flow {
+                Flow::Continue
+            }
+            fn initial_sel(&self) -> usize {
+                7
+            }
+        }
+        let mut h = Host::new(
+            None,
+            vec![
+                ("Low".into(), Box::new(OpensLow) as Box<dyn Screen>),
+                ("Other".into(), Box::new(Fake("o", 5))),
+            ],
+        );
+        assert_eq!(h.initial_sel(), 7, "a fresh tab opens where it asks to");
+        h.focus(0);
+        h.on_action(Action::NextTab, 0);
+        h.on_action(Action::PrevTab, 0);
+        assert_eq!(h.initial_sel(), 0, "row 0 was forgotten");
+    }
+
     /// A one-tab host is not a tab bar: no switching, and no footer line
     /// advertising a way to reach something that is not there.
     #[test]
@@ -327,6 +368,12 @@ mod tests {
                     None => Flow::Pop,
                 }
             }
+            fn tick(&mut self) -> Tick {
+                Tick::Busy
+            }
+            fn initial_sel(&self) -> usize {
+                4
+            }
         }
         let mut h = Host::new(
             None,
@@ -340,6 +387,7 @@ mod tests {
         assert!(h.sidebar().is_empty());
         assert!(matches!(h.on_sidebar(Action::Open, 0), Flow::Continue));
         assert!(matches!(h.answered(Some("x".into())), Flow::Continue));
+        assert!(matches!(h.tick(), Tick::Idle));
 
         h.on_action(Action::NextTab, 0);
 
@@ -351,6 +399,12 @@ mod tests {
             Flow::Detach(argv) => assert_eq!(argv, vec!["typed"]),
             _ => panic!("the answer went to the host's default rather than the tab"),
         }
+        assert!(matches!(h.tick(), Tick::Busy));
+        assert_eq!(
+            h.initial_sel(),
+            4,
+            "a tab not yet visited answers for itself"
+        );
     }
 
     #[test]

@@ -22,13 +22,22 @@
 //! that blocks forever on a terminal that ignored it is a program that never
 //! starts. One deadline covers the whole batch; whatever has not answered by
 //! then keeps its default, which is the value this repo's config sets anyway.
+//!
+//! ─── Why the deadline is a whole second ──────────────────────────────────
+//!
+//! It is only ever waited out by a terminal that answers NOTHING, because the
+//! device-attributes reply ends the wait the moment it arrives -- a few
+//! milliseconds, locally. What a short deadline buys is a hazard: a reply that
+//! turns up after it, over a slow link, is no longer read here. The event loop
+//! reads it instead, as keystrokes, and `rgb:` is three single-key actions on
+//! some screen.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
-const DEADLINE: Duration = Duration::from_millis(120);
+const DEADLINE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct TermInfo {
@@ -86,6 +95,22 @@ fn parse_rgb(s: &str) -> Option<[u8; 3]> {
     Some(out)
 }
 
+/// The colour at the head of `rest`, which runs on into whatever reply came
+/// after it.
+fn reply_rgb(rest: &str) -> Option<[u8; 3]> {
+    parse_rgb(rest.split(['\x07', '\x1b']).next()?)
+}
+
+/// Whether the device-attributes reply, `CSI ? ... c`, is in `buf`.
+///
+/// Looked for by its INTRODUCER. No other reply asked for here starts with
+/// `CSI ?`, where a bare `c` is also a hex digit of any colour that has one.
+fn da1_arrived(buf: &[u8]) -> bool {
+    buf.windows(3)
+        .position(|w| w == b"\x1b[?")
+        .is_some_and(|at| buf[at..].contains(&b'c'))
+}
+
 /// Must be called with the terminal already in raw mode, so the replies are
 /// readable rather than being line-buffered into the void.
 pub fn probe(indices: &[u8]) -> TermInfo {
@@ -129,7 +154,7 @@ pub fn probe(indices: &[u8]) -> TermInfo {
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
         // DA1 arrived: everything queued ahead of it is already in `buf`.
-        if buf.windows(2).any(|w| w == b"?6" || w == b"?1") && buf.contains(&b'c') {
+        if da1_arrived(&buf) {
             break;
         }
     }
@@ -149,16 +174,10 @@ pub fn probe(indices: &[u8]) -> TermInfo {
         }
     }
 
-    for (marker, slot) in [("\x1b]11;", 0usize), ("\x1b]10;", 1usize)] {
-        if let Some(rest) = text.split(marker).nth(1) {
-            if let Some(rgb) = parse_rgb(rest.split(['\x07', '\x1b']).next().unwrap_or("")) {
-                if slot == 0 {
-                    info.bg = rgb;
-                } else {
-                    info.fg = rgb;
-                }
-                info.measured = true;
-            }
+    for (marker, slot) in [("\x1b]11;", &mut info.bg), ("\x1b]10;", &mut info.fg)] {
+        if let Some(rgb) = text.split(marker).nth(1).and_then(reply_rgb) {
+            *slot = rgb;
+            info.measured = true;
         }
     }
 
@@ -167,8 +186,7 @@ pub fn probe(indices: &[u8]) -> TermInfo {
         let Some(idx) = it.next().and_then(|s| s.trim().parse::<u8>().ok()) else {
             continue;
         };
-        let Some(rest) = it.next() else { continue };
-        if let Some(rgb) = parse_rgb(rest.split(['\x07', '\x1b']).next().unwrap_or("")) {
+        if let Some(rgb) = it.next().and_then(reply_rgb) {
             info.palette.insert(idx, rgb);
         }
     }
@@ -178,7 +196,21 @@ pub fn probe(indices: &[u8]) -> TermInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_rgb;
+    use super::{da1_arrived, parse_rgb};
+
+    /// The finish line has to be the device-attributes reply itself, whole.
+    /// A colour full of `c`s is not it, and neither is the reply's first half
+    /// -- stopping there leaves the rest to be read as keystrokes.
+    #[test]
+    fn only_a_whole_device_attributes_reply_ends_the_wait() {
+        assert!(!da1_arrived(b"\x1b]11;rgb:cccc/cccc/cccc\x07"));
+        assert!(!da1_arrived(b"\x1b]11;rgb:cccc/cccc/cccc\x07\x1b[?65;4"));
+        assert!(da1_arrived(b"\x1b]11;rgb:cccc/cccc/cccc\x07\x1b[?65;4;6c"));
+        // Whatever the terminal claims to be: a VT100 answers `?1;2c`, wezterm
+        // `?65;...c`, and neither digit is special.
+        assert!(da1_arrived(b"\x1b[?1;2c"));
+        assert!(da1_arrived(b"\x1b[?42c"));
+    }
 
     /// Terminals answer in whatever channel width they like; all of them mean
     /// the same colour.

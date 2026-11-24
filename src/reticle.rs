@@ -98,7 +98,7 @@ impl Reticle {
 
     /// How many cells outside the label each bracket sits.
     pub fn spread(&self) -> u16 {
-        self.spread.round().max(SPREAD_MIN as f64 as f32) as u16
+        self.spread.round().max(SPREAD_MIN) as u16
     }
 }
 

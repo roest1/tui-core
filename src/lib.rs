@@ -21,9 +21,10 @@ pub mod screen;
 pub mod term;
 pub mod width;
 
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 static TERM_INFO: OnceLock<probe::TermInfo> = OnceLock::new();
+static UNPROBED: LazyLock<probe::TermInfo> = LazyLock::new(probe::TermInfo::default);
 
 /// What the terminal said about itself — cell size, foreground, background,
 /// palette. Probed once by `app::run`; defaults until then.
@@ -31,8 +32,11 @@ static TERM_INFO: OnceLock<probe::TermInfo> = OnceLock::new();
 /// A global rather than an argument threaded through every `pane()` because it
 /// is a property of the process's terminal, not of any screen, and it cannot
 /// change while the program runs.
+///
+/// Asking before the probe has run answers with the defaults WITHOUT keeping
+/// them, so an early caller cannot make the probe's answer unstorable.
 pub fn term_info() -> &'static probe::TermInfo {
-    TERM_INFO.get_or_init(probe::TermInfo::default)
+    TERM_INFO.get().unwrap_or(&UNPROBED)
 }
 
 pub(crate) fn set_term_info(info: probe::TermInfo) {

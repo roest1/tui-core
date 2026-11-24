@@ -123,13 +123,7 @@ pub fn width(s: &str) -> usize {
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            // CSI ... final-byte. Everything up to and including the first
-            // letter belongs to the escape.
-            for e in chars.by_ref() {
-                if e.is_ascii_alphabetic() {
-                    break;
-                }
-            }
+            rest_of_escape(&mut chars, |_| {});
             continue;
         }
         total += char_width(c);
@@ -137,29 +131,36 @@ pub fn width(s: &str) -> usize {
     total
 }
 
+/// Consume the escape whose `ESC` was just read, handing each character to
+/// `each`. CSI ... final-byte: everything up to and including the first letter
+/// belongs to it.
+fn rest_of_escape(chars: &mut std::str::Chars, mut each: impl FnMut(char)) {
+    for e in chars.by_ref() {
+        each(e);
+        if e.is_ascii_alphabetic() {
+            break;
+        }
+    }
+}
+
 /// Pad `s` on the right to `cells`, measured properly. Longer strings are
 /// returned unchanged -- the caller truncates if it needs to.
 pub fn pad(s: &str, cells: usize) -> String {
-    let w = width(s);
-    if w >= cells {
-        return s.to_string();
-    }
-    format!("{s}{}", " ".repeat(cells - w))
+    format!("{s}{}", " ".repeat(cells.saturating_sub(width(s))))
 }
 
 /// Pad `s` on the LEFT to `cells`, for a right-aligned column.
 pub fn rpad(s: &str, cells: usize) -> String {
-    let w = width(s);
-    if w >= cells {
-        return s.to_string();
-    }
-    format!("{}{s}", " ".repeat(cells - w))
+    format!("{}{s}", " ".repeat(cells.saturating_sub(width(s))))
 }
 
 /// Shorten `s` to at most `cells`, adding an ellipsis when it had to cut.
 ///
 /// Cuts on a character boundary and never inside an escape, so a truncated
 /// string cannot leave the terminal in whatever state a severed SGR implied.
+/// And it ends with a reset if it carried any styling, because the cut is
+/// what dropped the reset the string ended with: a truncated red line in the
+/// pane used to turn the plain lines under it red.
 pub fn truncate(s: &str, cells: usize) -> String {
     if width(s) <= cells {
         return s.to_string();
@@ -170,16 +171,13 @@ pub fn truncate(s: &str, cells: usize) -> String {
     let budget = cells - 1;
     let mut out = String::new();
     let mut used = 0;
+    let mut styled = false;
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
+            styled = true;
             out.push(c);
-            for e in chars.by_ref() {
-                out.push(e);
-                if e.is_ascii_alphabetic() {
-                    break;
-                }
-            }
+            rest_of_escape(&mut chars, |e| out.push(e));
             continue;
         }
         let w = char_width(c);
@@ -190,6 +188,9 @@ pub fn truncate(s: &str, cells: usize) -> String {
         used += w;
     }
     out.push('\u{2026}');
+    if styled {
+        out.push_str("\x1b[0m");
+    }
     out
 }
 
@@ -270,6 +271,10 @@ mod tests {
         let styled = truncate("\x1b[31mabcdef\x1b[0m", 4);
         assert!(styled.contains("\x1b[31m"), "{styled:?}");
         assert!(!styled.ends_with('\x1b'));
+        // The cut dropped the string's own reset, so one is put back: whatever
+        // is printed next must not inherit the red.
+        assert_eq!(styled, "\x1b[31mabc\u{2026}\x1b[0m");
+        assert_eq!(width(&styled), 4);
         // Nothing to do when it already fits.
         assert_eq!(truncate("ab", 8), "ab");
     }

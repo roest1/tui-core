@@ -57,28 +57,34 @@ pub fn first_leaf(rows: &[Row], vis: &[usize]) -> usize {
 /// Does this row match? Label and detail together, since a PR's author and a
 /// branch's subject are both things you would type.
 pub fn matches(row: &Row, needle: &str) -> bool {
+    matches_folded(row, &fold(needle))
+}
+
+/// Lowercased a character at a time, so both sides of the comparison fold the
+/// same way whatever surrounds a letter.
+fn fold(s: &str) -> String {
+    // The same answer for ASCII, which is nearly every row, at a quarter of
+    // the cost -- and this runs for every row on every frame a filter is up.
+    if s.is_ascii() {
+        return s.to_ascii_lowercase();
+    }
+    s.chars().flat_map(char::to_lowercase).collect()
+}
+
+/// The rows a group owns: those after it at a greater depth, up to the next
+/// row at its own depth or less.
+fn owned(rows: &[Row], i: usize) -> impl Iterator<Item = usize> + '_ {
+    (i + 1..rows.len()).take_while(move |&j| rows[j].depth > rows[i].depth)
+}
+
+/// `matches`, for a needle that is ALREADY folded -- so a whole list is
+/// compared against one folding of what was typed rather than one per row.
+fn matches_folded(row: &Row, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
-    let hay = match &row.detail {
-        Some(d) => format!("{} {}", row.label, d),
-        None => row.label.clone(),
-    };
-    contains_fold(&hay, needle)
-}
-
-/// Case-insensitive substring, without allocating a lowercased copy of every
-/// row on every keystroke.
-fn contains_fold(hay: &str, needle: &str) -> bool {
-    let h: Vec<char> = hay.chars().flat_map(char::to_lowercase).collect();
-    let n: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
-    if n.is_empty() {
-        return true;
-    }
-    if n.len() > h.len() {
-        return false;
-    }
-    h.windows(n.len()).any(|w| w == n.as_slice())
+    let detail = row.detail.as_deref().unwrap_or_default();
+    fold(&format!("{} {detail}", row.label)).contains(needle)
 }
 
 /// Indices of the rows to draw, in the order the screen gave them.
@@ -89,11 +95,21 @@ pub fn visible(rows: &[Row], needle: &str) -> Vec<usize> {
     if needle.is_empty() {
         return (0..rows.len()).collect();
     }
-    let hit: Vec<bool> = rows
+    let needle = fold(needle);
+    let mut keep: Vec<bool> = rows
         .iter()
-        .map(|r| r.selectable && matches(r, needle))
+        .map(|r| r.selectable && matches_folded(r, &needle))
         .collect();
-    let mut keep = hit.clone();
+    // A group whose own NAME matched brings everything under it, because that
+    // is what typing the name of a group means. Without this the heading came
+    // back alone, open and empty, and `enter` on it closed it.
+    for i in 0..rows.len() {
+        if rows[i].group && keep[i] {
+            for j in owned(rows, i) {
+                keep[j] = true;
+            }
+        }
+    }
     // A COLLAPSED group always survives, whatever the needle. Its children are
     // not in `rows` at all -- the screen never emitted them -- so the filter
     // cannot know whether a match is inside, and dropping it asserts there is
@@ -110,17 +126,8 @@ pub fn visible(rows: &[Row], needle: &str) -> Vec<usize> {
     // A group survives if anything it owns survives. Walked from the END so a
     // nested group is already resolved by the time its parent is considered.
     for i in (0..rows.len()).rev() {
-        if !rows[i].group || keep[i] {
-            continue;
-        }
-        for j in i + 1..rows.len() {
-            if rows[j].depth <= rows[i].depth {
-                break;
-            }
-            if keep[j] {
-                keep[i] = true;
-                break;
-            }
+        if rows[i].group && !keep[i] {
+            keep[i] = owned(rows, i).any(|j| keep[j]);
         }
     }
     (0..rows.len())
@@ -213,7 +220,10 @@ mod tests {
             .iter()
             .map(|&i| rows[i].label.as_str())
             .collect();
-        assert_eq!(labels, vec!["your branches"]);
+        assert_eq!(
+            labels,
+            vec!["your branches", "feat/dots", "feat/github-tui"]
+        );
     }
 
     /// Spacers are a grouping device. Three blank lines between two surviving
@@ -278,7 +288,17 @@ mod tests {
         assert!(v.windows(2).all(|w| w[0] < w[1]), "{v:?}");
     }
 
-    /// The needle being longer than the row must not panic the window walk.
+    /// The ASCII shortcut in `fold` must not be a different answer from the
+    /// general path, only a cheaper one.
+    #[test]
+    fn folding_is_the_same_with_and_without_ascii() {
+        assert_eq!(fold("Feat/GitHub-TUI"), "feat/github-tui");
+        assert_eq!(fold("\u{c9}t\u{c9}"), "\u{e9}t\u{e9}");
+        let rows = vec![Row::leaf("\u{c9}t\u{e9} 2026")];
+        assert_eq!(visible(&rows, "\u{e9}T\u{c9}"), vec![0]);
+    }
+
+    /// A needle longer than the row is simply no match.
     #[test]
     fn a_needle_longer_than_the_row_is_simply_no_match() {
         let rows = vec![Row::leaf("ab")];

@@ -13,6 +13,11 @@ were; trim them here.
   other half), `width` (how many CELLS a string occupies), `app` (the loop),
   `image` (inline images), `filter` (what `/` narrows a list to), `probe` (asks the
   terminal for its cell size and colors).
+- `tests/pty.rs` — the event loop, driven through a real pty. The unit tests are of
+  helpers; every bug the loop has had was in `app::event_loop`, which only this reaches.
+  A change to the loop gets a check here. It waits for the screen to show something
+  rather than sleeping, and a check that a key did NOT act uses a second key whose
+  effect depends on the first. `cargo test --test pty -- <name>` runs one.
 
 ## Things not to undo
 
@@ -198,8 +203,8 @@ were; trim them here.
 - **Tabs are for siblings; the stack is for drilling in.** `tui_core::Host` owns
   one `Screen` per tab and forwards to the active one, so a screen does not
   know it became a tab — `Actions` was written before tabs existed and is a tab
-  now, unchanged. `Tab`/shift-`Tab` move along; `Flow::Push` from inside a tab
-  opens over the WHOLE host and `q` returns to the tab you left.
+  now, unchanged. `h`/`l` on the strip move along; `Flow::Push` from inside a
+  tab opens over the WHOLE host and `q` returns to the tab you left.
 
   Six things about one repo are not six levels deep. A stack would make Issues
   → PRs a pop and a push through a hub that exists only to be passed through.
@@ -266,6 +271,29 @@ were; trim them here.
   and hid the assertion that failed.
 - **Do not add keys to `nav` for one screen.** `Action::Key(char)` is the escape hatch, and
   it exists so the shared table stays shared.
+- **Every `Flow` goes through `app::apply`.** There were four copies of that match, one
+  per handler, and they drifted: a sidebar pick returned `Flow::Dirty` and the list beside
+  it was never re-read, so `enter` opened a row other than the one drawn. A new place that
+  asks a screen something calls `apply` with the answer.
+- **The row under the cursor is an `Option`.** A filter that hides every row leaves
+  `None`, and nothing row-addressed is sent to the screen. Falling back to row 0 let a key
+  act on a row that was not on screen.
+- **The mouse is not captured.** Nothing reads it. Capturing it woke the loop on every
+  pointer movement (about 2KB redrawn each), blocked text selection and left the wheel
+  dead; uncaptured, the terminal sends the wheel as arrow keys.
+- **Pastes are bracketed, because the mouse is not captured.** A middle click pastes now.
+  Unbracketed, each pasted letter is a single-key action; bracketed, the paste is one
+  event, typed into an open field (first line only) and dropped everywhere else.
+- **A frame is assembled in a `Vec` and written once.** Not a `BufWriter`: a panic restores
+  the terminal and then unwinds, and a `BufWriter` dropped on the way out flushes its
+  half-drawn frame over the panic message.
+- **Only time spent animating steps the reticle.** Counting the wait for a key spent four
+  frames of travel at once, so a single keypress never showed the spread opening.
+- **The probe's deadline is a second, and DA1 ends it early.** A reply that arrives after
+  the deadline is read by the event loop as keystrokes.
+- **A detached child owns ctrl-c.** `detach` holds a do-nothing SIGINT handler while the
+  child runs, or stopping the child kills the TUI with it. A handler, not `SIG_IGN`,
+  which the child would inherit.
 
 ## Sharpness, and where it comes from
 

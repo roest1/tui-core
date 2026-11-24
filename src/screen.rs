@@ -30,9 +30,10 @@ pub struct Row {
     /// Short markers — a status word, a fit verdict, a column of a table —
     /// each with its ANSI colour.
     ///
-    /// RIGHT-ALIGNED to the list's right edge, laid out right to left in the
-    /// order given, with the text before them truncated to make room — so a
-    /// long family name can never shove a badge across the divider.
+    /// RIGHT-ALIGNED to the list's right edge and drawn in the order given,
+    /// so the LAST one is rightmost, with the text before them truncated to
+    /// make room — so a long family name can never shove a badge across the
+    /// divider.
     ///
     /// SEVERAL, because a full-width table is a row with six facts on the
     /// right of it and one badge could only hold the last. They do not
@@ -67,7 +68,7 @@ impl Row {
         r
     }
 
-    /// Add one marker, rightmost first.
+    /// Add one marker, to the right of any already added.
     pub fn badged(mut self, text: impl Into<String>, color: u8) -> Self {
         self.badges.push((text.into(), color));
         self

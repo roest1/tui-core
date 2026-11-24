@@ -84,6 +84,10 @@ const CHECKS: &[(&str, Check)] = &[
         the_sidebar_wears_its_own_brackets,
     ),
     (
+        "a_screen_can_move_its_sidebar_cursor",
+        a_screen_can_move_its_sidebar_cursor,
+    ),
+    (
         "a_sidebar_screen_has_no_pane_to_enter",
         a_sidebar_screen_has_no_pane_to_enter,
     ),
@@ -111,10 +115,22 @@ const CHECKS: &[(&str, Check)] = &[
         "a_long_label_still_wears_the_brackets",
         a_long_label_still_wears_the_brackets,
     ),
+    (
+        "a_closed_group_leaves_the_cursor_on_a_row",
+        a_closed_group_leaves_the_cursor_on_a_row,
+    ),
+    (
+        "a_screen_cannot_drive_the_terminal",
+        a_screen_cannot_drive_the_terminal,
+    ),
     ("a_resize_redraws_the_frame", a_resize_redraws_the_frame),
     (
         "ctrl_c_stops_the_child_and_not_the_tui",
         ctrl_c_stops_the_child_and_not_the_tui,
+    ),
+    (
+        "a_detached_child_starts_where_it_is_told",
+        a_detached_child_starts_where_it_is_told,
     ),
     (
         "the_mouse_is_left_alone_and_pastes_are_bracketed",
@@ -169,6 +185,23 @@ fn the_sidebar_wears_its_own_brackets() -> Result<(), String> {
     t.send("j")?;
     t.wait("the brackets on the sidebar's cursor", |t| {
         t.bracketed().as_deref() == Some("pick-bravo")
+    })
+}
+
+/// A sidebar row that closes takes the cursor to where the screen says, not
+/// to whatever now has the old row's number. Here `h` on the second row
+/// answers `Flow::Retarget` and asks for the first.
+fn a_screen_can_move_its_sidebar_cursor() -> Result<(), String> {
+    let mut t = Term::open("side", 24, 100)?;
+    t.wait("the first frame", |t| t.shows("alpha-0"))?;
+    t.send("h")?;
+    t.send("j")?;
+    t.wait("the cursor on the second sidebar row", |t| {
+        t.bracketed().as_deref() == Some("pick-bravo")
+    })?;
+    t.send("h")?;
+    t.wait("the cursor where the screen put it", |t| {
+        t.bracketed().as_deref() == Some("pick-alpha")
     })
 }
 
@@ -278,6 +311,49 @@ fn a_long_label_still_wears_the_brackets() -> Result<(), String> {
     })
 }
 
+/// `h` on a group's child closes the group and answers `Flow::Dirty`. The
+/// cursor kept its position, which was now the blank row under the heading:
+/// no brackets, an empty pane and a dead `enter`.
+fn a_closed_group_leaves_the_cursor_on_a_row() -> Result<(), String> {
+    let mut t = Term::open("tree", 24, 100)?;
+    t.wait("the first frame", |t| t.shows("child-0"))?;
+    t.send("j")?;
+    t.wait("the cursor on a child", |t| {
+        t.bracketed().as_deref() == Some("child-0")
+    })?;
+    t.send("h")?;
+    t.wait("the cursor on the heading, and the screen told so", |t| {
+        !t.shows("child-0")
+            && t.bracketed().as_deref() == Some("group")
+            && t.footer().starts_with("told 0")
+    })
+}
+
+/// Text a screen was handed -- here a title, a label, a badge and a pane line
+/// each carrying an escape sequence -- reaches the terminal as text. The
+/// sequences are the clipboard-setting OSC 52, a device status request, and a
+/// carriage return; none of them may be in what was written.
+fn a_screen_cannot_drive_the_terminal() -> Result<(), String> {
+    let mut t = Term::open("hostile", 24, 100)?;
+    t.wait("every part of the screen", |t| {
+        t.shows("title") && t.shows("label") && t.shows("badge") && t.shows("pane line")
+    })?;
+    t.quiet()?;
+    for sent in [&b"\x1b]52"[..], b"\x1b[5n", b"\rpane"] {
+        if t.wrote(sent) {
+            return Err(format!(
+                "  {:?} reached the terminal",
+                String::from_utf8_lossy(sent)
+            ));
+        }
+    }
+    // Colour is not hostile, and is still there.
+    if !t.wrote(b"\x1b[38;5;203mred") {
+        return Err("  a colour the screen asked for was taken out".into());
+    }
+    Ok(())
+}
+
 /// A resize redrew the rows and nothing else: the divider stopped where the
 /// old screen ended.
 fn a_resize_redraws_the_frame() -> Result<(), String> {
@@ -303,6 +379,20 @@ fn ctrl_c_stops_the_child_and_not_the_tui() -> Result<(), String> {
     if !t.alive() {
         return Err("  the TUI died with its child".into());
     }
+    t.grid.clear();
+    t.send("\r")?;
+    t.wait("the screen to come back", |t| t.shows("plain-0"))
+}
+
+/// `Flow::DetachIn` runs the child in the directory it names, whatever
+/// directory this process was started in.
+fn a_detached_child_starts_where_it_is_told() -> Result<(), String> {
+    let mut t = Term::open("plain", 24, 100)?;
+    t.wait("the first frame", |t| t.shows("plain-0"))?;
+    t.send("w")?;
+    t.wait("the child to say where it is", |t| {
+        t.wrote(b"/\r\n\r\n  done")
+    })?;
     t.grid.clear();
     t.send("\r")?;
     t.wait("the screen to come back", |t| t.shows("plain-0"))
@@ -760,6 +850,11 @@ fn show(which: &str) {
                 ("Two".into(), Box::new(Plain::named("two"))),
             ],
         )),
+        "tree" => Box::new(Tree {
+            open: true,
+            told: 0,
+        }),
+        "hostile" => Box::new(Hostile),
         "long" => Box::new(Plain::named(
             "a-label-that-is-much-longer-than-the-left-column-can-possibly-hold",
         )),
@@ -798,11 +893,18 @@ impl Screen for Side {
         vec![Row::leaf("pick-alpha"), Row::leaf("pick-bravo")]
     }
     fn on_sidebar(&mut self, action: Action, sel: usize) -> Flow {
-        if action == Action::Activate {
-            self.mode = sel;
-            return Flow::Dirty;
+        match action {
+            Action::Activate => {
+                self.mode = sel;
+                Flow::Dirty
+            }
+            // As a dropdown closing from one of its options would.
+            Action::Close if sel > 0 => Flow::Retarget,
+            _ => Flow::Continue,
         }
-        Flow::Continue
+    }
+    fn initial_side_sel(&self) -> Option<usize> {
+        Some(0)
     }
     fn footer(&self) -> String {
         "side footer".into()
@@ -819,6 +921,78 @@ impl Screen for Side {
             )))),
             _ => Flow::Continue,
         }
+    }
+}
+
+/// Every string a screen can hand over, each with something in it that a
+/// terminal would act on.
+struct Hostile;
+
+impl Screen for Hostile {
+    fn title(&self) -> String {
+        "title\x1b]52;c;aGk=\x07".into()
+    }
+    fn rows(&mut self) -> Vec<Row> {
+        vec![Row::leaf("label\x1b[5n")
+            .detail("detail\x1b]52;c;aGk=\x1b\\")
+            .badged("badge\x1b[5n", 244)]
+    }
+    fn footer(&self) -> String {
+        "footer\x1b[5n".into()
+    }
+    fn pane(&mut self, _: usize, _: u16, _: u16) -> Pane {
+        Pane {
+            image: None,
+            lines: vec!["\x1b[38;5;203mred\x1b[0m\rpane line\x1b]52;c;aGk=\x07".into()],
+        }
+    }
+    fn on_action(&mut self, _: Action, _: usize) -> Flow {
+        Flow::Continue
+    }
+}
+
+/// One group over a blank row and a leaf. `h` on a child closes the group.
+struct Tree {
+    open: bool,
+    /// The row `focus` last named.
+    told: usize,
+}
+
+impl Screen for Tree {
+    fn title(&self) -> String {
+        "tree".into()
+    }
+    fn rows(&mut self) -> Vec<Row> {
+        let mut head = Row::leaf("group");
+        head.group = true;
+        head.expanded = self.open;
+        let mut rows = vec![head];
+        if self.open {
+            rows.extend((0..2).map(|i| {
+                let mut child = Row::leaf(format!("child-{i}"));
+                child.depth = 1;
+                child
+            }));
+        }
+        rows.push(Row::spacer());
+        rows.push(Row::leaf("after"));
+        rows
+    }
+    fn footer(&self) -> String {
+        format!("told {}", self.told)
+    }
+    fn focus(&mut self, sel: usize) {
+        self.told = sel;
+    }
+    fn pane(&mut self, _: usize, _: u16, _: u16) -> Pane {
+        Pane::default()
+    }
+    fn on_action(&mut self, action: Action, _: usize) -> Flow {
+        if action == Action::Close && self.open {
+            self.open = false;
+            return Flow::Dirty;
+        }
+        Flow::Continue
     }
 }
 
@@ -866,6 +1040,10 @@ impl Screen for Plain {
                 "-c".into(),
                 "echo ready; exec sleep 30".into(),
             ]),
+            Action::Key('w') => Flow::DetachIn {
+                dir: "/".into(),
+                argv: vec!["pwd".into()],
+            },
             Action::Key('a') => {
                 self.asked = 1;
                 Flow::Ask {

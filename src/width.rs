@@ -27,6 +27,71 @@
 //! If a screen ever needs CJK text, swap this for the crate. The signature is
 //! the same and the call sites would not change.
 
+/// `s` with everything that could DRIVE the terminal taken out.
+///
+/// A screen draws text it was handed -- a branch name, a pull request's title,
+/// a line of a CI log -- and whoever wrote that text chose its bytes. A
+/// terminal obeys what it is sent: `ESC ] 52` sets the clipboard, `ESC [ 2 J`
+/// clears the screen, a carriage return moves the cursor into the list beside
+/// the pane. So `app` passes everything a screen gives it through here on the
+/// way out, and a screen cannot forget to.
+///
+/// Kept: colours, which screens use on purpose -- `ESC [ ... m` with nothing
+/// in it but digits, `;` and `:`. Dropped: every other escape sequence, whole,
+/// and every control character. A tab becomes a space, since the terminal
+/// would otherwise jump to a tab stop the layout knows nothing about.
+///
+/// An allowlist, not a list of what is dangerous. The second would need to
+/// be complete, about every terminal.
+pub fn clean(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.chars().any(char::is_control) {
+        return s.into();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.next() {
+                // CSI: parameters, then one final byte that says what it is.
+                Some('[') => {
+                    let mut params = String::new();
+                    let last = chars.by_ref().find(|&p| {
+                        let done = ('\x40'..='\x7e').contains(&p);
+                        if !done {
+                            params.push(p);
+                        }
+                        done
+                    });
+                    let colour = params
+                        .chars()
+                        .all(|p| p.is_ascii_digit() || p == ';' || p == ':');
+                    if last == Some('m') && colour {
+                        out.push_str("\x1b[");
+                        out.push_str(&params);
+                        out.push('m');
+                    }
+                }
+                // The ones that carry a string: OSC, DCS, SOS, PM, APC. Gone
+                // up to the bell or the `ESC \` that ends them -- or to the
+                // end, if nothing does.
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    while let Some(p) = chars.next() {
+                        if p == '\x07' || (p == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                // Any other escape is itself and one character.
+                _ => {}
+            },
+            '\t' => out.push(' '),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out.into()
+}
+
 /// Cells one character occupies.
 ///
 /// Zero for a combining mark, two for a default-emoji-presentation character,
@@ -257,6 +322,37 @@ mod tests {
         for c in &right {
             assert_eq!(width(c), 5, "{c:?}");
         }
+    }
+
+    /// What a screen draws must not be able to drive the terminal. These are
+    /// the things a pull request's title or a line of a log could carry.
+    #[test]
+    fn only_colours_get_through() {
+        // The ordinary case costs nothing and changes nothing.
+        assert!(matches!(
+            clean("feat/x \u{2705}"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        // Colours are kept exactly.
+        let red = "\x1b[1;38;5;203mfail\x1b[0m";
+        assert_eq!(clean(red), red);
+        assert_eq!(clean("\x1b[38:2::1:2:3mx"), "\x1b[38:2::1:2:3mx");
+        // The clipboard, by either terminator, and an unterminated one.
+        assert_eq!(clean("a\x1b]52;c;aGk=\x07b"), "ab");
+        assert_eq!(clean("a\x1b]52;c;aGk=\x1b\\b"), "ab");
+        assert_eq!(clean("a\x1b]52;c;aGk="), "a");
+        // Clearing the screen, moving the cursor, asking the terminal to
+        // report -- and a private sequence that merely ENDS in `m`.
+        assert_eq!(clean("a\x1b[2Jb\x1b[10;10Hc\x1b[5nd"), "abcd");
+        assert_eq!(clean("a\x1b[?1049mb\x1b[>4;2mc"), "abc");
+        // A device control string, and a two-character escape.
+        assert_eq!(clean("a\x1bPq#0;2;0;0;0\x1b\\b\x1bcc"), "abc");
+        // Bare control characters. A tab is a space; a bell is nothing.
+        assert_eq!(clean("a\rb\nc\x07d\te\u{9b}2Jf\x7f"), "abcd e2Jf");
+        // An escape cut off by the end of the string takes nothing with it
+        // that was not part of it.
+        assert_eq!(clean("ab\x1b"), "ab");
+        assert_eq!(clean("ab\x1b[31"), "ab");
     }
 
     /// Truncation must respect cells too, and must never sever an escape --

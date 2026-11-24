@@ -232,6 +232,18 @@ pub enum Flow {
     /// First element is the program; the rest are arguments, unsplit and
     /// unquoted, so nothing here goes through a shell.
     Detach(Vec<String>),
+    /// `Detach`, with the child started in `dir`.
+    ///
+    /// For a command that acts on whatever repository it is standing in and
+    /// has no flag to be told otherwise -- `gh pr checkout` is one. The
+    /// program a screen belongs to may have been started anywhere, so "the
+    /// current directory" has to be said. Without this the only way to say it
+    /// was to wrap the command in `sh -c 'cd …'`: the shell that `Detach`
+    /// promises nothing goes through.
+    DetachIn {
+        dir: std::path::PathBuf,
+        argv: Vec<String>,
+    },
     Quit,
 }
 
@@ -320,5 +332,16 @@ pub trait Screen {
     /// names a spacer, so a stale answer cannot put the cursor nowhere.
     fn initial_sel(&self) -> usize {
         0
+    }
+
+    /// Which SIDEBAR row to put that cursor on, if the screen has a view.
+    /// Default: none, and the sidebar cursor stays where it is.
+    ///
+    /// Asked whenever `initial_sel` is, so `Flow::Retarget` can move either
+    /// cursor. A sidebar is a column of dropdowns, and closing one from an
+    /// option inside it moves every row below: without this the cursor kept
+    /// its number and landed on a different control.
+    fn initial_side_sel(&self) -> Option<usize> {
+        None
     }
 }

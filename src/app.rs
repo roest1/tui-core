@@ -19,6 +19,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -148,6 +149,11 @@ impl Frame {
         if let Some(at) = under_cursor(rows, &vis, self.sel) {
             self.screen.focus(at);
         }
+        if let Some(row) = self.screen.initial_side_sel() {
+            self.side_sel = row;
+            self.side_top = 0;
+            self.side_reticle = Reticle::new(row);
+        }
         self.opened = true;
     }
 }
@@ -221,14 +227,26 @@ enum Focus {
 /// information, not an error for this process, and the user has just watched
 /// the output scroll past. What matters is that the terminal comes back even
 /// if the child dies badly -- hence resume() on every path.
-fn detach(term: &mut Terminal, out: &mut impl Write, argv: &[String]) -> io::Result<()> {
+///
+/// In `dir` if one is given, and otherwise wherever this process is.
+fn detach(
+    term: &mut Terminal,
+    out: &mut impl Write,
+    argv: &[String],
+    dir: Option<&Path>,
+) -> io::Result<()> {
     let Some((program, args)) = argv.split_first() else {
         return Ok(());
     };
     term.suspend()?;
     let status = {
         let _child_owns_ctrl_c = ChildOwnsCtrlC::new();
-        Command::new(program).args(args).status()
+        let mut child = Command::new(program);
+        child.args(args);
+        if let Some(dir) = dir {
+            child.current_dir(dir);
+        }
+        child.status()
     };
     // A beat to read the last line before the alternate screen swallows it.
     let _ = writeln!(out);
@@ -312,7 +330,11 @@ fn apply(
         Flow::Push(next) => return Ok(Outcome::Push(next)),
         Flow::Dirty => *rows = frame.screen.rows(),
         Flow::Detach(argv) => {
-            detach(term, out, &argv)?;
+            detach(term, out, &argv, None)?;
+            *rows = frame.screen.rows();
+        }
+        Flow::DetachIn { dir, argv } => {
+            detach(term, out, &argv, Some(&dir))?;
             *rows = frame.screen.rows();
         }
         Flow::Ask { label, initial } => {
@@ -369,8 +391,19 @@ fn event_loop(screens: Vec<Box<dyn Screen>>, term: &mut Terminal) -> io::Result<
         // filter exists and why every screen already written gained filtering
         // without a line changing in it.
         let mut vis = crate::filter::visible(&rows, &frame.filter);
-        if frame.sel >= vis.len() {
-            frame.sel = vis.len().saturating_sub(1);
+        // Wherever these rows came from -- a key, a refresh that landed, a
+        // group that closed -- the cursor rests on one that can be selected.
+        // A screen that answered `Flow::Dirty` after closing a group used to
+        // leave it on the blank row that took the place of what it was on.
+        let rested = settled(&rows, &vis, frame.sel);
+        if rested != frame.sel {
+            frame.sel = rested;
+            // And the screen is told, as it is when a key moves the cursor:
+            // what it believes about where the cursor is has to stay true.
+            if let Some(at) = under_cursor(&rows, &vis, rested) {
+                frame.screen.focus(at);
+            }
+            pane_dirty = true;
         }
         // `None` when a filter hides every row. There is nothing to act ON
         // then, and a key sent with a made-up row 0 would act on a row nobody
@@ -988,6 +1021,7 @@ fn draw_frame(out: &mut impl Write, screen: &mut dyn Screen, c: &Chrome) -> io::
     match tabs {
         None => {
             let title = screen.title();
+            let title = crate::width::clean(&title);
             queue!(out, style::Print(format!("\x1b[1m{title}\x1b[0m")))?;
         }
         Some(t) => {
@@ -1032,10 +1066,12 @@ fn tab_strip(tabs: &Tabs, cols: u16, focused: bool) -> String {
     let mut out = String::from(" ");
     let mut width = 1usize;
     if let Some(label) = &tabs.label {
-        out.push_str(&fg(245, label));
-        width += crate::width::width(label);
+        let label = crate::width::clean(label);
+        out.push_str(&fg(245, &label));
+        width += crate::width::width(&label);
     }
     for (i, name) in tabs.names.iter().enumerate() {
+        let name = crate::width::clean(name);
         // Width is counted from the PLAIN text, because the SGR codes are
         // zero-width on screen and characters in the string -- the same
         // arithmetic `lib/sgr.sh` and the row renderer both have to do.
@@ -1044,7 +1080,7 @@ fn tab_strip(tabs: &Tabs, cols: u16, focused: bool) -> String {
         } else {
             "  "
         };
-        let plain = sep.len() + crate::width::width(name) + if i == tabs.active { 4 } else { 0 };
+        let plain = sep.len() + crate::width::width(&name) + if i == tabs.active { 4 } else { 0 };
         if width + plain + 1 > cols as usize {
             out.push_str(&fg(240, '\u{2026}'));
             break;
@@ -1130,10 +1166,15 @@ fn draw_rows(
         // Every marker plus one space of air between each and one before the
         // divider. Reserved FIRST, so the label is truncated to what is left
         // rather than pushing a badge across the divider.
-        let badge_w: u16 = if row.badges.is_empty() {
+        let badges: Vec<_> = row
+            .badges
+            .iter()
+            .map(|(text, colour)| (crate::width::clean(text), colour))
+            .collect();
+        let badge_w: u16 = if badges.is_empty() {
             0
         } else {
-            row.badges
+            badges
                 .iter()
                 .map(|(t, _)| crate::width::width(t) as u16 + 1)
                 .sum::<u16>()
@@ -1193,7 +1234,7 @@ fn draw_rows(
         // them in that order on screen. A table that pads each value to a fixed
         // width then comes out as columns.
         let mut bx = left;
-        for (badge, color) in row.badges.iter().rev() {
+        for (badge, color) in badges.iter().rev() {
             let w = crate::width::width(badge) as u16;
             bx = bx.saturating_sub(w + 1);
             queue!(out, cursor::MoveTo(bx, y), style::Print(fg(color, badge)))?;
@@ -1312,6 +1353,15 @@ fn start_sel(screen: &dyn Screen, rows: &[Row], vis: &[usize]) -> usize {
 /// group headings, which a filter can produce -- cannot hang the caller.
 fn first_selectable(rows: &[Row], vis: &[usize], from: usize, dir: isize) -> usize {
     scan(rows, vis, from as isize, dir).unwrap_or(from.min(vis.len().saturating_sub(1)))
+}
+
+/// Where a cursor at `sel` comes to rest: on the list, and on something
+/// selectable -- the nearest above, or failing that the nearest below.
+fn settled(rows: &[Row], vis: &[usize], sel: usize) -> usize {
+    let at = sel.min(vis.len().saturating_sub(1)) as isize;
+    scan(rows, vis, at, -1)
+        .or_else(|| scan(rows, vis, at, 1))
+        .unwrap_or(at as usize)
 }
 
 /// The first selectable position from `start`, walking in `dir`.
@@ -1445,15 +1495,19 @@ fn draw_footer(
 /// ANSI escape is none. The character-counting version this replaces was the
 /// reason emoji had to be kept out of every fixed-width column: one `char`
 /// that draws two cells shifted everything after it by one.
+///
+/// And cleaned first. Every label, detail, pane line and footer a screen
+/// supplies comes through here on its way to the terminal, which makes it the
+/// place to take out anything that would drive it -- see `width::clean`.
 fn truncate(s: &str, width: u16) -> String {
-    crate::width::truncate(s, width as usize)
+    crate::width::truncate(&crate::width::clean(s), width as usize)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         first_selectable, footer_lines, jump, layout, left_width, poll_timeout, scrolled, seek,
-        under_cursor, Duration, FRAME,
+        settled, under_cursor, Duration, FRAME,
     };
     use crate::nav::Action;
     use crate::screen::Row;
@@ -1578,6 +1632,21 @@ mod tests {
         assert_eq!(seek(&rows, &all, 2, 1), 4);
         assert_eq!(seek(&rows, &all, 4, -1), 2);
         assert_eq!(seek(&rows, &all, 2, -1), 0);
+    }
+
+    /// A cursor is never left on a blank row, whoever moved the rows. Up to
+    /// the nearest selectable one, which after a group closes is its heading;
+    /// down only when there is nothing above.
+    #[test]
+    fn a_cursor_comes_to_rest_on_something_selectable() {
+        let rows = list();
+        let all: Vec<usize> = (0..rows.len()).collect();
+        assert_eq!(settled(&rows, &all, 2), 2);
+        assert_eq!(settled(&rows, &all, 1), 0);
+        assert_eq!(settled(&rows, &all, 9), 4, "past the end is the end");
+        let led = vec![Row::spacer(), Row::leaf("only")];
+        assert_eq!(settled(&led, &[0, 1], 0), 1);
+        assert_eq!(settled(&[], &[], 3), 0);
     }
 
     /// At the ends, staying put beats wrapping or landing on a blank.

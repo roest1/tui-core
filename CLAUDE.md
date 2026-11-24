@@ -291,6 +291,28 @@ were; trim them here.
   frames of travel at once, so a single keypress never showed the spread opening.
 - **The probe's deadline is a second, and DA1 ends it early.** A reply that arrives after
   the deadline is read by the event loop as keystrokes.
+- **A tab that answers `Flow::Retarget` gets its mark dropped.** `Host::initial_sel`
+  prefers the cursor it remembered, so a hosted screen that asked to move its own
+  cursor (a group it closed, a row inserted above) was handed the old position
+  straight back. The same screen pushed instead of hosted worked.
+- **The cursor never rests on an unselectable row.** `app` settles it at the top of
+  every frame: up to the nearest selectable row, down only if there is none above.
+  A screen that closed a group from a child and answered `Flow::Dirty` used to leave
+  it on the blank row underneath: no brackets, an empty pane, a dead `enter`.
+- **What a screen draws cannot drive the terminal.** Every title, label, detail, badge,
+  pane line and footer goes through `width::clean` on its way out: colours survive
+  (`ESC [ … m` with only digits, `;` and `:`), every other escape sequence and every
+  control character is dropped. A screen draws text it was handed (a pull request's
+  title, a line of a CI log), and `ESC ] 52` in that text set the clipboard. It is an
+  allowlist in the draw path so that no screen has to remember, and
+  `a_screen_cannot_drive_the_terminal` holds it.
+- **`Flow::DetachIn` exists so nothing has to go through a shell to change directory.**
+  `gh pr checkout` acts on the repository it is standing in and has no flag to be told
+  otherwise. The alternative was `sh -c 'cd … && exec …'`, which is the shell `Detach`
+  promises nothing goes through, and it is what the confirm pane then showed.
+- **`initial_side_sel` is asked wherever `initial_sel` is.** A sidebar is a column of
+  dropdowns; closing one from an option inside it moves every row below, and
+  `Flow::Retarget` could only say where the MAIN cursor belongs.
 - **A detached child owns ctrl-c.** `detach` holds a do-nothing SIGINT handler while the
   child runs, or stopping the child kills the TUI with it. A handler, not `SIG_IGN`,
   which the child would inherit.

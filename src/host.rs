@@ -81,6 +81,21 @@ impl Host {
         self.screens[self.active].as_ref()
     }
 
+    /// Pass on what the active tab answered.
+    ///
+    /// A tab that answers `Flow::Retarget` is saying where ITS cursor belongs
+    /// now -- a group it just closed, a row it just moved. The mark kept for it
+    /// is where the cursor WAS, and `initial_sel` prefers a mark, so without
+    /// dropping it here a hosted screen asked `app` to move the cursor and got
+    /// the old position handed straight back. The same screen pushed rather
+    /// than hosted worked, which is how it went unnoticed.
+    fn answer_of_tab(&mut self, flow: Flow) -> Flow {
+        if matches!(flow, Flow::Retarget) {
+            self.marks[self.active] = None;
+        }
+        flow
+    }
+
     fn step(&mut self, by: isize) -> Flow {
         if self.screens.len() < 2 {
             return Flow::Continue;
@@ -132,7 +147,8 @@ impl Screen for Host {
     }
 
     fn on_sidebar(&mut self, action: Action, sel: usize) -> Flow {
-        self.current().on_sidebar(action, sel)
+        let flow = self.current().on_sidebar(action, sel);
+        self.answer_of_tab(flow)
     }
 
     /// The THIRD forward forgotten here, and the one that proved the pattern
@@ -146,7 +162,8 @@ impl Screen for Host {
     /// default body is a method `Host` has to forward, and the test below
     /// covers every one of them rather than the one that just broke.
     fn answered(&mut self, text: Option<String>) -> Flow {
-        self.current().answered(text)
+        let flow = self.current().answered(text);
+        self.answer_of_tab(flow)
     }
 
     fn footer(&self) -> String {
@@ -187,13 +204,20 @@ impl Screen for Host {
         self.marks[self.active].unwrap_or_else(|| self.active().initial_sel())
     }
 
+    fn initial_side_sel(&self) -> Option<usize> {
+        self.active().initial_side_sel()
+    }
+
     fn on_action(&mut self, action: Action, sel: usize) -> Flow {
         match action {
             Action::NextTab | Action::PrevTab => {
                 self.marks[self.active] = Some(sel);
                 self.step(if action == Action::NextTab { 1 } else { -1 })
             }
-            other => self.current().on_action(other, sel),
+            other => {
+                let flow = self.current().on_action(other, sel);
+                self.answer_of_tab(flow)
+            }
         }
     }
 }
@@ -311,6 +335,45 @@ mod tests {
         assert_eq!(h.initial_sel(), 0, "row 0 was forgotten");
     }
 
+    /// A tab can move its own cursor. `Flow::Retarget` means "ask me where",
+    /// and a host that answers with the position it remembered instead is
+    /// answering for the tab.
+    #[test]
+    fn a_tab_that_retargets_is_asked_where() {
+        struct Jumps;
+        impl Screen for Jumps {
+            fn title(&self) -> String {
+                "jumps".into()
+            }
+            fn rows(&mut self) -> Vec<Row> {
+                (0..9).map(|i| Row::leaf(format!("j{i}"))).collect()
+            }
+            fn footer(&self) -> String {
+                String::new()
+            }
+            fn pane(&mut self, _: usize, _: u16, _: u16) -> Pane {
+                Pane::default()
+            }
+            fn on_action(&mut self, _: Action, _: usize) -> Flow {
+                Flow::Retarget
+            }
+            fn initial_sel(&self) -> usize {
+                6
+            }
+        }
+        let mut h = Host::new(
+            None,
+            vec![
+                ("Jumps".into(), Box::new(Jumps) as Box<dyn Screen>),
+                ("Other".into(), Box::new(Fake("o", 5))),
+            ],
+        );
+        h.focus(2);
+        assert_eq!(h.initial_sel(), 2, "the mark, while nothing has moved");
+        assert!(matches!(h.on_action(Action::Activate, 2), Flow::Retarget));
+        assert_eq!(h.initial_sel(), 6, "the host answered for the tab");
+    }
+
     /// A one-tab host is not a tab bar: no switching, and no footer line
     /// advertising a way to reach something that is not there.
     #[test]
@@ -374,6 +437,9 @@ mod tests {
             fn initial_sel(&self) -> usize {
                 4
             }
+            fn initial_side_sel(&self) -> Option<usize> {
+                Some(1)
+            }
         }
         let mut h = Host::new(
             None,
@@ -388,6 +454,7 @@ mod tests {
         assert!(matches!(h.on_sidebar(Action::Open, 0), Flow::Continue));
         assert!(matches!(h.answered(Some("x".into())), Flow::Continue));
         assert!(matches!(h.tick(), Tick::Idle));
+        assert_eq!(h.initial_side_sel(), None);
 
         h.on_action(Action::NextTab, 0);
 
@@ -405,6 +472,7 @@ mod tests {
             4,
             "a tab not yet visited answers for itself"
         );
+        assert_eq!(h.initial_side_sel(), Some(1));
     }
 
     #[test]
